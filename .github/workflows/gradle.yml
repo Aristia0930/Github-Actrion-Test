@@ -1,4 +1,4 @@
-name: Build JAR & Deploy to EC2 (no image build)
+name: Build JAR & Deploy to EC2 (image rebuild on server)
 
 on:
   push:
@@ -29,22 +29,25 @@ jobs:
       - name: Build Spring Boot JAR
         run: ./gradlew clean bootJar --no-daemon
 
+      # 최신 산출물 경로를 잡아 아웃풋으로 전달
       - name: Find built JAR
         id: findjar
         run: |
           JAR_PATH=$(ls -t build/libs/*.jar | head -n1)
-          echo "JAR_PATH=$JAR_PATH"
-          echo "jar_path=$JAR_PATH" >> $GITHUB_OUTPUT
+          echo "Found JAR: $JAR_PATH"
+          echo "jar_path=$JAR_PATH" >> "$GITHUB_OUTPUT"
 
-      - name: Copy JAR to EC2
+      # 업로드는 디렉터리 타겟으로만 가능하므로 upload/로 올린 뒤 서버에서 파일명 교체
+      - name: Copy JAR to EC2 (to upload dir)
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           source: ${{ steps.findjar.outputs.jar_path }}
-          target: /home/ubuntu/arfni-deploy/apps/app.jar
+          target: /home/ubuntu/arfni-deploy/apps/upload
           overwrite: true
+          strip_components: 0
 
       - name: Restart Docker Compose on EC2
         uses: appleboy/ssh-action@v1.2.0
@@ -53,9 +56,49 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            set -e
+            set -euo pipefail
+
             cd /home/ubuntu/arfni-deploy
-            echo "[INFO] Restarting container..."
-            sudo docker compose up -d
+
+            # 0) 폴더 준비
+            mkdir -p apps/upload
+
+            # 1) 가장 최근 업로드된 JAR을 표준 이름으로 교체
+            LATEST_JAR=$(ls -t apps/upload/*.jar | head -n1)
+            if [ -z "${LATEST_JAR:-}" ]; then
+              echo "[ERROR] No jar found in apps/upload"; exit 1
+            fi
+            echo "[INFO] Latest uploaded jar: $LATEST_JAR"
+
+            # .dockerignore에 *.jar / build/ 들어있으면 COPY 실패하니 꼭 제외
+            if [ -f apps/.dockerignore ]; then
+              sed -i '/\*\.jar/d' apps/.dockerignore || true
+              sed -i '/^build\/\?/d' apps/.dockerignore || true
+            fi
+
+            # 표준 파일명으로 배치 (Dockerfile이 COPY app.jar 하므로)
+            cp -f "$LATEST_JAR" apps/app.jar
+            ls -l apps/app.jar
+
+            # 2) 이전 컨테이너 정리 후 이미지 리빌드
+            echo "[INFO] Rebuilding image..."
+            sudo docker compose down
+            sudo docker compose build --pull --no-cache spring
+
+            # 3) 재기동
+            echo "[INFO] Starting containers..."
+            sudo docker compose up -d spring
+
+            # 4) (옵션) 헬스체크 대기: Spring Actuator 사용 시
+            #    actuator 의존 없으면 주석 처리하거나 URL 수정
+            echo "[INFO] Waiting for health..."
+            for i in $(seq 1 30); do
+              if curl -sf http://127.0.0.1:8080/actuator/health >/dev/null 2>&1; then
+                echo "[INFO] Spring is healthy"; break
+              fi
+              sleep 2
+            done
+
             echo "[INFO] Running containers:"
-            sudo docker ps
+            sudo docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"
+

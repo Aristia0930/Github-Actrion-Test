@@ -64,7 +64,7 @@ jobs:
             mkdir -p apps/upload
 
             # 1) 가장 최근 업로드된 JAR을 표준 이름으로 교체
-            LATEST_JAR=$(ls -t apps/upload/*.jar | head -n1)
+            LATEST_JAR=$(ls -t apps/upload/build/libs/*.jar | head -n1)
             if [ -z "${LATEST_JAR:-}" ]; then
               echo "[ERROR] No jar found in apps/upload"; exit 1
             fi
@@ -89,16 +89,6 @@ jobs:
             echo "[INFO] Starting containers..."
             sudo docker compose up -d spring
 
-            # 4) (옵션) 헬스체크 대기: Spring Actuator 사용 시
-            #    actuator 의존 없으면 주석 처리하거나 URL 수정
-            echo "[INFO] Waiting for health..."
-            for i in $(seq 1 30); do
-              if curl -sf http://127.0.0.1:8080/actuator/health >/dev/null 2>&1; then
-                echo "[INFO] Spring is healthy"; break
-              fi
-              sleep 2
-            done
-
-            echo "[INFO] Running containers:"
+            echo "[INFO] Runnng containers:"
             sudo docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"
 

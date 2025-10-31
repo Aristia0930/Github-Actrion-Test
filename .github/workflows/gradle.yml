@@ -29,18 +29,18 @@ jobs:
       - name: Build Spring Boot JAR
         run: ./gradlew clean bootJar --no-daemon
 
-      # 산출물을 고정 파일명 app.jar로 준비 (경로 평탄화용)
-      - name: Prepare upload artifact (rename to app.jar)
+      # 산출물을 고정 파일명 app.new.jar로 준비 (서버에서 교체 전용)
+      - name: Prepare upload artifact (rename to app.new.jar)
         run: |
           set -euo pipefail
           JAR_PATH=$(ls -t build/libs/*.jar | head -n1)
           echo "[INFO] Picked jar: ${JAR_PATH}"
           mkdir -p build/upload
-          cp -f "${JAR_PATH}" build/upload/app.jar
-          ls -lh build/upload/app.jar
+          cp -f "${JAR_PATH}" build/upload/app.new.jar
+          ls -lh build/upload/app.new.jar
 
-      # (안전) 원격 업로드 대상 디렉터리 보장
-      - name: Ensure target dir exists on EC2
+      # (안전) 원격 업로드 대상 디렉터리/백업 디렉터리 보장
+      - name: Ensure target dirs exist on EC2
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -48,22 +48,22 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -euo pipefail
-            mkdir -p /home/ubuntu/arfni-deploy/apps
+            mkdir -p /home/ubuntu/arfni-deploy/apps/backups
 
-      # app.jar 업로드 (build/upload/ 제거하여 apps/app.jar 로 배치)
-      - name: Copy app.jar to EC2
+      # app.new.jar 업로드 (build/upload/ 제거하여 apps/app.new.jar 로 배치)
+      - name: Copy app.new.jar to EC2
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          source: build/upload/app.jar
+          source: build/upload/app.new.jar
           target: /home/ubuntu/arfni-deploy/apps
           overwrite: true
-          strip_components: 2   # => apps/app.jar 로 저장
+          strip_components: 2   # => apps/app.new.jar 로 저장
 
-      # 서버에서 무결성 점검 후 도커 리빌드 & 재기동
-      - name: Rebuild & restart on EC2
+      # 서버에서 백업 회전 후 교체, 도커 리빌드 & 재기동
+      - name: Backup previous JAR, swap, and restart
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -73,22 +73,34 @@ jobs:
             set -euo pipefail
             cd /home/ubuntu/arfni-deploy
 
-            echo "[INFO] Checking uploaded JAR at apps/app.jar ..."
-            if [ ! -s apps/app.jar ]; then
-              echo "[ERROR] apps/app.jar not found or empty"; exit 1
-            fi
-
-            # ZIP 매직넘버 'PK\x03\x04' 확인
-            if ! head -c4 apps/app.jar | hexdump -C | grep -q '50 4b 03 04'; then
-              echo "[ERROR] apps/app.jar is not a valid zip/jar (bad header)"; exit 1
-            fi
-
-            # .dockerignore에서 jar/build 제외 금지 항목 제거
+            # .dockerignore에서 jar/build 제외 금지 항목 제거 (있으면 제거)
             if [ -f apps/.dockerignore ]; then
               sed -i '/^\*\.jar$/d' apps/.dockerignore || true
               sed -i '/^build\/\?$/d' apps/.dockerignore || true
               sed -i '/\.jar/d' apps/.dockerignore || true
             fi
+
+            # 새 파일 존재 확인
+            if [ ! -s apps/app.new.jar ]; then
+              echo "[ERROR] apps/app.new.jar not found or empty"
+              exit 1
+            fi
+
+            # 이전 app.jar 백업 (타임스탬프)
+            if [ -f apps/app.jar ]; then
+              TS=$(date +%Y%m%d-%H%M%S)
+              mv -f apps/app.jar "apps/backups/app-${TS}.jar"
+              echo "[INFO] Backed up previous to apps/backups/app-${TS}.jar"
+            else
+              echo "[INFO] No previous app.jar to backup."
+            fi
+
+            # (선택) 백업 회전: 최신 5개만 보관
+            ls -1t apps/backups/app-*.jar 2>/dev/null | tail -n +6 | xargs -r rm -f
+
+            # 새 파일로 교체
+            mv -f apps/app.new.jar apps/app.jar
+            ls -lh apps/app.jar
 
             echo "[INFO] Docker compose rebuild..."
             sudo docker compose down

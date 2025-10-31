@@ -29,7 +29,7 @@ jobs:
       - name: Build Spring Boot JAR
         run: ./gradlew clean bootJar --no-daemon
 
-      # 최신 산출물을 고정 파일명 app.jar로 복사하여 업로드 단순화
+      # 산출물을 고정 파일명 app.jar로 준비 (경로 평탄화용)
       - name: Prepare upload artifact (rename to app.jar)
         run: |
           set -euo pipefail
@@ -39,7 +39,18 @@ jobs:
           cp -f "${JAR_PATH}" build/upload/app.jar
           ls -lh build/upload/app.jar
 
-      # EC2의 /home/ubuntu/arfni-deploy/apps 에 app.jar 업로드 (파일명 유지)
+      # (안전) 원격 업로드 대상 디렉터리 보장
+      - name: Ensure target dir exists on EC2
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            mkdir -p /home/ubuntu/arfni-deploy/apps
+
+      # app.jar 업로드 (build/upload/ 제거하여 apps/app.jar 로 배치)
       - name: Copy app.jar to EC2
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -49,8 +60,9 @@ jobs:
           source: build/upload/app.jar
           target: /home/ubuntu/arfni-deploy/apps
           overwrite: true
+          strip_components: 2   # => apps/app.jar 로 저장
 
-      # 서버에서 무결성 점검 후 도커 이미지 리빌드 & 컨테이너 재기동
+      # 서버에서 무결성 점검 후 도커 리빌드 & 재기동
       - name: Rebuild & restart on EC2
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -61,27 +73,20 @@ jobs:
             set -euo pipefail
             cd /home/ubuntu/arfni-deploy
 
-            echo "[INFO] Checking uploaded JAR..."
+            echo "[INFO] Checking uploaded JAR at apps/app.jar ..."
             if [ ! -s apps/app.jar ]; then
               echo "[ERROR] apps/app.jar not found or empty"; exit 1
             fi
 
-            # ZIP 매직넘버 'PK\x03\x04' 확인 (정상 JAR/ZIP 헤더)
+            # ZIP 매직넘버 'PK\x03\x04' 확인
             if ! head -c4 apps/app.jar | hexdump -C | grep -q '50 4b 03 04'; then
               echo "[ERROR] apps/app.jar is not a valid zip/jar (bad header)"; exit 1
             fi
 
-            # jar 목록 검사(선택) - 실패해도 빌드 계속하려면 || true
-            if command -v jar >/dev/null 2>&1; then
-              jar tf apps/app.jar | head -n 5 || true
-            fi
-
-            # .dockerignore가 jar/build를 막지 않도록 정리
+            # .dockerignore에서 jar/build 제외 금지 항목 제거
             if [ -f apps/.dockerignore ]; then
-              # 라인 전체 일치 케이스 제거
               sed -i '/^\*\.jar$/d' apps/.dockerignore || true
               sed -i '/^build\/\?$/d' apps/.dockerignore || true
-              # 혹시 남아 있을 수 있는 광범위 패턴도 보수적으로 제거
               sed -i '/\.jar/d' apps/.dockerignore || true
             fi
 
@@ -94,11 +99,10 @@ jobs:
             echo "[INFO] Running containers:"
             sudo docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"
 
-            echo "[INFO] Tail spring logs (last 60 lines):"
-            # 컨테이너 이름은 compose 프로젝트명에 따라 달라질 수 있어 서비스명으로 grep
+            echo "[INFO] Tail spring logs (last 80 lines):"
             CID=$(sudo docker ps -qf "name=spring" | head -n1 || true)
             if [ -n "${CID:-}" ]; then
-              sudo docker logs --tail=60 "$CID" || true
+              sudo docker logs --tail=80 "$CID" || true
             else
               echo "[WARN] spring container not found"
             fi

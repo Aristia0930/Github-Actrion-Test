@@ -3,30 +3,17 @@ name: Build JAR & Deploy to EC2 (image rebuild on server)
 on:
   push:
     branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "main"
+        required: true
+        default: "main"
 
-# 🔧 전역 변수(필요 시 여기만 고치면 됨)
 env:
   JAVA_VERSION: "17"
   JAVA_DIST: "temurin"
-
-  # 빌드 산출물 관련
-  JAR_GLOB: "build/libs/*.jar"
-  UPLOAD_DIR: "build/upload"
-  UPLOAD_NAME: "app.new.jar"
-  FINAL_NAME: "app.jar"
-
-  # 원격 서버 경로
   DEPLOY_ROOT: "/home/ubuntu/arfni-deploy"
-  APP_DIR: "/home/ubuntu/arfni-deploy/apps"
-  BACKUP_DIR: "/home/ubuntu/arfni-deploy/apps/backups"
-
-  # Docker / 서비스
-  DOCKER_SERVICE: "spring"
-  DOCKER_COMPOSE: "sudo docker compose"
-  DOCKER_BUILD_FLAGS: "--pull --no-cache"
-
-  # .dockerignore 수정 토글
-  FIX_DOCKERIGNORE: "true"
 
 jobs:
   build_and_deploy:
@@ -35,8 +22,10 @@ jobs:
       contents: read
 
     steps:
-      - name: Checkout source
+      - name: Checkout source (push or manual)
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.branch || github.ref_name }}
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -53,14 +42,14 @@ jobs:
       - name: Build Spring Boot JAR
         run: ./gradlew clean bootJar --no-daemon
 
-      - name: Prepare upload artifact (rename to ${{ env.UPLOAD_NAME }})
+      - name: Prepare upload artifact
         run: |
           set -euo pipefail
-          JAR_PATH=$(ls -t ${{ env.JAR_GLOB }} | head -n1)
+          JAR_PATH=$(ls -t build/libs/*.jar | head -n1)
           echo "[INFO] Picked jar: ${JAR_PATH}"
-          mkdir -p "${{ env.UPLOAD_DIR }}"
-          cp -f "${JAR_PATH}" "${{ env.UPLOAD_DIR }}/${{ env.UPLOAD_NAME }}"
-          ls -lh "${{ env.UPLOAD_DIR }}/${{ env.UPLOAD_NAME }}"
+          mkdir -p "build/upload"
+          cp -f "${JAR_PATH}" "build/upload/app.new.jar"
+          ls -lh "build/upload/app.new.jar"
 
       - name: Ensure target dirs exist on EC2
         uses: appleboy/ssh-action@v1.2.0
@@ -70,18 +59,17 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -euo pipefail
-            mkdir -p "${{ env.BACKUP_DIR }}"
+            mkdir -p "${{ env.DEPLOY_ROOT }}/apps/backups"
 
-      - name: Copy ${{ env.UPLOAD_NAME }} to EC2
+      - name: Copy to EC2
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          source: ${{ env.UPLOAD_DIR }}/${{ env.UPLOAD_NAME }}
-          target: ${{ env.APP_DIR }}
+          source: build/upload/app.new.jar
+          target: ${{ env.DEPLOY_ROOT }}/apps
           overwrite: true
-          # build/upload/<file> → apps/<file>
           strip_components: 2
 
       - name: Backup previous JAR, swap, and restart
@@ -94,48 +82,44 @@ jobs:
             set -euo pipefail
             cd "${{ env.DEPLOY_ROOT }}"
 
-            # (옵션) .dockerignore 수정
-            if [ "${{ env.FIX_DOCKERIGNORE }}" = "true" ] && [ -f "${{ env.APP_DIR }}/.dockerignore" ]; then
-              sed -i '/^\*\.jar$/d' "${{ env.APP_DIR }}/.dockerignore" || true
-              sed -i '/^build\/\?$/d' "${{ env.APP_DIR }}/.dockerignore" || true
-              sed -i '/\.jar/d'       "${{ env.APP_DIR }}/.dockerignore" || true
-            fi
+            APP_DIR="${{ env.DEPLOY_ROOT }}/apps"
+            BACKUP_DIR="${{ env.DEPLOY_ROOT }}/apps/backups"
 
             # 새 파일 확인
-            if [ ! -s "${{ env.APP_DIR }}/${{ env.UPLOAD_NAME }}" ]; then
-              echo "[ERROR] ${{ env.APP_DIR }}/${{ env.UPLOAD_NAME }} not found or empty"
+            if [ ! -s "${APP_DIR}/app.new.jar" ]; then
+              echo "[ERROR] ${APP_DIR}/app.new.jar not found or empty"
               exit 1
             fi
 
             # 기존 JAR 백업
-            if [ -f "${{ env.APP_DIR }}/${{ env.FINAL_NAME }}" ]; then
+            if [ -f "${APP_DIR}/app.jar" ]; then
               TS=$(date +%Y%m%d-%H%M%S)
-              mv -f "${{ env.APP_DIR }}/${{ env.FINAL_NAME }}" "${{ env.BACKUP_DIR }}/app-${TS}.jar"
-              echo "[INFO] Backed up to ${{ env.BACKUP_DIR }}/app-${TS}.jar"
+              mv -f "${APP_DIR}/app.jar" "${BACKUP_DIR}/app-${TS}.jar"
+              echo "[INFO] Backed up to ${BACKUP_DIR}/app-${TS}.jar"
             else
-              echo "[INFO] No previous ${{ env.FINAL_NAME }} to backup."
+              echo "[INFO] No previous app.jar to backup."
             fi
 
             # 백업 5개 유지
-            ls -1t "${{ env.BACKUP_DIR }}"/app-*.jar 2>/dev/null | tail -n +6 | xargs -r rm -f
+            ls -1t "${BACKUP_DIR}"/app-*.jar 2>/dev/null | tail -n +6 | xargs -r rm -f
 
             # 새 파일로 교체
-            mv -f "${{ env.APP_DIR }}/${{ env.UPLOAD_NAME }}" "${{ env.APP_DIR }}/${{ env.FINAL_NAME }}"
-            ls -lh "${{ env.APP_DIR }}/${{ env.FINAL_NAME }}"
+            mv -f "${APP_DIR}/app.new.jar" "${APP_DIR}/app.jar"
+            ls -lh "${APP_DIR}/app.jar"
 
             echo "[INFO] Docker compose rebuild..."
-            ${{ env.DOCKER_COMPOSE }} down
-            ${{ env.DOCKER_COMPOSE }} build ${{ env.DOCKER_BUILD_FLAGS }} ${{ env.DOCKER_SERVICE }}
-            echo "[INFO] Starting ${{ env.DOCKER_SERVICE }}..."
-            ${{ env.DOCKER_COMPOSE }} up -d ${{ env.DOCKER_SERVICE }}
+            sudo docker compose down
+            sudo docker compose build spring
+            echo "[INFO] Starting spring..."
+            sudo docker compose up -d spring
 
             echo "[INFO] Running containers:"
-            sudo docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"
+            sudo docker ps --format "table {{.Names}}	{{.Image}}	{{.Status}}"
 
-            echo "[INFO] Tail ${{ env.DOCKER_SERVICE }} logs (last 80 lines):"
-            CID=$(sudo docker ps -qf "name=${{ env.DOCKER_SERVICE }}" | head -n1 || true)
+            echo "[INFO] Tail spring logs (last 80 lines):"
+            CID=$(sudo docker ps -qf "name=spring" | head -n1 || true)
             if [ -n "${CID:-}" ]; then
-              sudo docker logs --tail=80 "$CID" || true
+              sudo docker logs --tail=80 "${CID}" || true
             else
-              echo "[WARN] ${{ env.DOCKER_SERVICE }} container not found"
+              echo "[WARN] spring container not found"
             fi

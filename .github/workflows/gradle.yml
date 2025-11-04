@@ -83,37 +83,41 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -euo pipefail
+            cd "${{ env.DEPLOY_ROOT }}"
+
             APP_DIR="${{ env.DEPLOY_ROOT }}/apps"
             BACKUP_DIR="${{ env.DEPLOY_ROOT }}/apps/backups"
-            UPLOAD_NAME="app.new.jar"
-            FINAL_NAME="app.jar"
-            DOCKER_COMPOSE="sudo docker compose"
 
-            if [ ! -s "${APP_DIR}/${UPLOAD_NAME}" ]; then
-              echo "[ERROR] ${APP_DIR}/${UPLOAD_NAME} not found or empty"; exit 1
+            # 새 파일 확인
+            if [ ! -s "${APP_DIR}/app.new.jar" ]; then
+              echo "[ERROR] ${APP_DIR}/app.new.jar not found or empty"
+              exit 1
             fi
 
-            if [ -f "${APP_DIR}/${FINAL_NAME}" ]; then
+            # 기존 JAR 백업
+            if [ -f "${APP_DIR}/app.jar" ]; then
               TS=$(date +%Y%m%d-%H%M%S)
-              mv -f "${APP_DIR}/${FINAL_NAME}" "${BACKUP_DIR}/app-${TS}.jar"
+              mv -f "${APP_DIR}/app.jar" "${BACKUP_DIR}/app-${TS}.jar"
               echo "[INFO] Backed up to ${BACKUP_DIR}/app-${TS}.jar"
             else
-              echo "[INFO] No previous ${FINAL_NAME} to backup."
+              echo "[INFO] No previous app.jar to backup."
             fi
 
+            # 백업 5개 유지
             ls -1t "${BACKUP_DIR}"/app-*.jar 2>/dev/null | tail -n +6 | xargs -r rm -f
 
-            mv -f "${APP_DIR}/${UPLOAD_NAME}" "${APP_DIR}/${FINAL_NAME}"
-            ls -lh "${APP_DIR}/${FINAL_NAME}"
+            # 새 파일로 교체
+            mv -f "${APP_DIR}/app.new.jar" "${APP_DIR}/app.jar"
+            ls -lh "${APP_DIR}/app.jar"
 
             echo "[INFO] Docker compose rebuild..."
-            ${DOCKER_COMPOSE} down
-            ${DOCKER_COMPOSE} build spring
+            sudo docker compose down
+            sudo docker compose build spring
             echo "[INFO] Starting spring..."
-            ${DOCKER_COMPOSE} up -d spring
+            sudo docker compose up -d spring
 
             echo "[INFO] Running containers:"
-            sudo docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"
+            sudo docker ps --format "table {{.Names}}	{{.Image}}	{{.Status}}"
 
             echo "[INFO] Tail spring logs (last 80 lines):"
             CID=$(sudo docker ps -qf "name=spring" | head -n1 || true)
@@ -122,3 +126,4 @@ jobs:
             else
               echo "[WARN] spring container not found"
             fi
+
